@@ -1,0 +1,1737 @@
+diff --git a/verl/experimental/teacher_loop/teacher_model.py b/verl/experimental/teacher_loop/teacher_model.py
+index 128f2bca..05da2375 100644
+--- a/verl/experimental/teacher_loop/teacher_model.py
++++ b/verl/experimental/teacher_loop/teacher_model.py
+@@ -194,6 +194,13 @@ class MultiTeacherModelManager:
+         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
+ 
+         self.resource_pool = resource_pool
++        if self.distillation_config.share_student_resource_pool:
++            from verl.plugin.platform import get_platform
++            from verl.trainer.distillation.resource_pool import teacher_resource_pool_id
++
++            teacher_resource_pool_id(config)
++            if get_platform().ray_resource_name() != "GPU" or resource_pool.max_colocate_count < 3:
++                raise ValueError("Shared teacher requires CUDA GPU colocation with max_colocate_count >= 3")
+         self.teacher_model_managers: dict[str, TeacherModelManager] = {}
+         self.server_addresses: dict[str, list[str]] = {}
+         self.server_handles: dict[str, list] = {}
+diff --git a/verl/trainer/config/distillation/distillation.yaml b/verl/trainer/config/distillation/distillation.yaml
+index 84ee7932..af4321b7 100644
+--- a/verl/trainer/config/distillation/distillation.yaml
++++ b/verl/trainer/config/distillation/distillation.yaml
+@@ -55,6 +55,13 @@ distillation_loss:
+   clip_ratio_high: 0.2
+ 
+ 
++# Experimental: reuse the single hybrid student's actual GPU placement group.
++# Requires one FSDP/FSDP2 GRPO student and one vLLM teacher, TP/DP/PP/EP=1,
++# eager inference and explicit kv_cache_memory_bytes for both engines.
++# Resident teacher must set free_cache_engine=false and enable_sleep_mode=false.
++# Teacher weights + KV stay resident even during student training; budget accordingly.
++share_student_resource_pool: false
++
+ # Number of GPUs per node in the distillation teacher resource pool
+ n_gpus_per_node: 8
+ 
+diff --git a/verl/trainer/main_ppo_v0.py b/verl/trainer/main_ppo_v0.py
+index bf2a59ef..b8a18987 100644
+--- a/verl/trainer/main_ppo_v0.py
++++ b/verl/trainer/main_ppo_v0.py
+@@ -91,8 +91,11 @@ class BaseTaskRunner:
+             if distillation_config.nnodes <= 0:
+                 raise ValueError("config.distillation.nnodes must be greater than 0")
+ 
+-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+-            resource_pool_spec["teacher_pool"] = teacher_pool
++            from verl.trainer.distillation.resource_pool import teacher_resource_pool_id
++
++            if teacher_resource_pool_id(config) == "teacher_pool":
++                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
++                resource_pool_spec["teacher_pool"] = teacher_pool
+ 
+         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+ 
+@@ -118,7 +121,9 @@ class BaseTaskRunner:
+         if is_distillation_enabled(config.get("distillation")):
+             # we do not use teacher model workers, so we only register teacher model in resource pool
+             # without registering a teacher model worker in role-worker mapping
+-            self.mapping[Role.TeacherModel] = "teacher_pool"
++            from verl.trainer.distillation.resource_pool import teacher_resource_pool_id
++
++            self.mapping[Role.TeacherModel] = teacher_resource_pool_id(config)
+ 
+     def add_ref_policy_worker(self, config, ref_policy_cls):
+         """Ref policy is fused into ActorRolloutRefWorker in the unified model engine.
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 01723eb7..9005c887 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -841,9 +841,15 @@ class PPOTrainer(ABC):
+             if distillation_config.nnodes <= 0:
+                 raise ValueError("config.distillation.nnodes must be greater than 0")
+ 
+-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+-            resource_pool_spec["teacher_pool"] = teacher_pool
+-            self.mapping[Role.TeacherModel] = "teacher_pool"
++            from verl.trainer.distillation.resource_pool import teacher_resource_pool_id
++
++            teacher_pool_id = teacher_resource_pool_id(config)
++            if teacher_pool_id == "global_pool" and not getattr(self, "_enable_hybrid_replicas", True):
++                raise ValueError("Shared teacher resource pool requires hybrid student replicas")
++            if teacher_pool_id == "teacher_pool":
++                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
++                resource_pool_spec[teacher_pool_id] = teacher_pool
++            self.mapping[Role.TeacherModel] = teacher_pool_id
+ 
+         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+ 
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index b58f8bcc..d68f9312 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -260,6 +260,8 @@ class DistillationConfig(BaseConfig):
+     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
+ 
+     enabled: bool = False
++    # Experimental resident teacher sharing the single hybrid student's placement group.
++    share_student_resource_pool: bool = False
+     n_gpus_per_node: int = 0
+     nnodes: int = 0
+     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
+@@ -271,6 +273,15 @@ class DistillationConfig(BaseConfig):
+             return
+ 
+         self.teacher_models = self._resolve_teacher_models()
++        if self.share_student_resource_pool:
++            if self.nnodes != 1 or self.n_gpus_per_node != 1 or len(self.teacher_models) != 1:
++                raise ValueError("Shared teacher resource pool requires one teacher on one GPU on one node")
++            inference = next(iter(self.teacher_models.values())).inference
++            if inference.free_cache_engine or inference.enable_sleep_mode:
++                raise ValueError(
++                    "Shared teacher must remain resident without a sleep-mode pool: "
++                    "set free_cache_engine=false and enable_sleep_mode=false"
++                )
+         teacher_world_size_sum = 0
+         for teacher_model in self.teacher_models.values():
+             teacher_model.validate_and_prepare_for_distillation(
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 6ad86589..49e3a725 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -863,8 +863,10 @@ class vLLMHttpServer:
+             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+             await self.engine.reset_prefix_cache(reset_connector=True)
+         elif self.rollout_mode == RolloutMode.COLOCATED:
+-            # Directly call engine to wake up without sync weights.
+-            await self.engine.wake_up(tags=self._get_wake_up_tags())
++            # Resident engines with sleep mode disabled are already awake.
++            if self.config.enable_sleep_mode:
++                # Directly call engine to wake up without sync weights.
++                await self.engine.wake_up(tags=self._get_wake_up_tags())
+             # reset_connector=True drops any attached external KV store
+             # (e.g. MooncakeStoreConnector) whose entries were computed
+             # against the previous weights. No-op success when no connector
+diff --git a/examples/on_policy_distillation_trainer/README.single_gpu_smoke.md b/examples/on_policy_distillation_trainer/README.single_gpu_smoke.md
+new file mode 100644
+index 00000000..8fafc9d4
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/README.single_gpu_smoke.md
+@@ -0,0 +1,80 @@
++# Experimental single-GPU OPD smoke
++
++From the repo root on eryx, in the existing Python environment:
++
++Use the guarded launcher; a previous unguarded run exhausted unified memory:
++
++```bash
++export PYTHONPATH="$PWD/examples/on_policy_distillation_trainer/diagnostics${PYTHONPATH:+:$PYTHONPATH}"
++export OPD_DIAGNOSTIC_DIR="$HOME/od-$(date +%H%M%S)"
++python3 examples/on_policy_distillation_trainer/diagnostics/guard.py \
++  --log-dir "$OPD_DIAGNOSTIC_DIR" --timeout 600 -- \
++  bash examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh
++```
++
++See [diagnostics/README.md](diagnostics/README.md) for limits and cleanup checks.
++
++The launcher uses `/home/eryx/models/Qwen3.5-35B-A3B-FP8` as teacher and
++`/home/eryx/models/Qwen3.5-2B` as student (overridable via `TEACHER_MODEL` and
++`STUDENT_MODEL`). It writes two synthetic GSM8K-schema rows under
++`logs/single_gpu_opd_smoke/`, then runs one FSDP2 update with batch 2, prompt
++128, response 16, eager vLLM, no torch compile, and console metrics. No downloads
++or uv environment synchronization are performed. Student Transformers attention
++uses PyTorch SDPA with padding retained: the installed standalone FlashAttention
++wheel lacks a kernel for GB10. vLLM's own attention backend is unchanged.
++On unified-memory GB10 the smoke disables training parameter/optimizer CPU
++offload, uses non-foreach AdamW, and starts only one reward worker. These are
++smoke-only peak-memory controls; FP32 training weights and optimizer states are
++retained. Student rollout sleep and weight synchronization are unchanged.
++Synthetic data is only a plumbing smoke test, not a training-quality benchmark.
++Look for global step 1, finite distillation loss and actor gradient norm in the
++output.
++
++`distillation.share_student_resource_pool=true` maps the teacher role to the
++**same** `global_pool` object as the student. Teacher replicas reuse that pool's
++actual placement group and bundle through both existing `split_resource_pool`
++calls. Ray worker groups reserve 1/3 GPU each in its one-GPU bundle; vLLM HTTP
++server actors reserve no additional GPU and obtain the physical device ID from
++those workers. This does not advertise nonexistent GPUs or bypass availability
++checks. Default separate-teacher placement is unchanged.
++
++The opt-in topology is deliberately restricted to one node, one GPU, one hybrid
++FSDP/FSDP2 student, critic-free GRPO without reference/reward models, and one
++vLLM teacher with TP/DP/PP/EP all 1. Both engines require eager inference and
++positive explicit `engine_kwargs.vllm.kv_cache_memory_bytes`. Teacher
++`free_cache_engine=false` keeps its weights and KV **resident for the entire
++job**, including student backward/optimizer steps. Teacher
++`enable_sleep_mode=false` avoids vLLM's private sleep-mode memory pool, which
++retained roughly 40 GiB of FP8 MoE conversion temporaries in a guarded GB10 run.
++The resident colocated server skips engine wake-up but still resets the prefix
++cache. Student rollout sleep and weight synchronization remain unchanged, with
++student `enable_sleep_mode=true`. The teacher
++is never placed in the student's checkpoint/weight-sync replica list, and no
++per-sample sleep/wake eviction of the student is attempted: teacher requests run
++while student rollout is awake.
++
++Smoke KV allocations are 512 MiB teacher and 256 MiB student; these are fixed
++cache budgets, **not total engine budgets**. GPU-memory-utilization 0.35/0.15
++keeps startup admission conservative, but model weights, activation/workspace,
++Mamba state, optimizer state, and host offload memory are additional. FP8 teacher
++weights, student rollout weights, and student training allocations must fit
++simultaneously. Unified CPU/GPU memory does not make offload free. Explicit KV
++budgets prevent percentage-based KV sizing from consuming memory needed by the
++other engine; they do not guarantee absence of OOM. Eager execution avoids
++CUDA-graph capture allocations. The successful guarded eryx one-step run
++(`/home/eryx/opd-log5`) still briefly reserved 83.32 GiB in the teacher, used
++11.55 GiB swap, and reached 27.64 GiB system MemAvailable; teacher reservation
++recovered to about 34.5 GiB after warmup. Disabling sleep fixes retained
++reservations, not all
++transient peaks. Keep the guard enabled. Larger models/sequences/batches need
++separate memory measurements; this option is not a general multi-GPU sharing
++scheduler.
++
++## Verified smoke result
++
++`/home/eryx/opd-log5/acceptance-proof.json` records global step 1, actor loss
++1.70812988, distillation loss 1.70812994, a finite positive gradient norm
++831.65027 (before clipping), and learning rate 1e-6. The optimizer step ended,
++updated weights synchronized, and the guardian exited 0 with cleanup OK. GPU
++workloads were gone and available RAM recovered to 118 GiB. Long-run stability
++and training quality are not established by this single synthetic update.
+diff --git a/examples/on_policy_distillation_trainer/diagnostics/README.md b/examples/on_policy_distillation_trainer/diagnostics/README.md
+new file mode 100644
+index 00000000..63fc71c3
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/diagnostics/README.md
+@@ -0,0 +1,79 @@
++# Single-GPU OPD diagnostic guard
++
++`guard.py` is a dependency-free **Linux** supervisor, not a GPU profiler. Run it
++on the training host, before the existing smoke script, with the remote Python
++and model environment already configured. It does not SSH, download models, or
++change the smoke launcher's settings. Do not run concurrent Ray/training jobs.
++
++From the repository root (substitute the host's actual environment paths):
++
++```bash
++export PATH=/path/to/training/venv/bin:$PATH
++# Keep this path short: Ray uses Unix sockets with a 107-byte path limit.
++RUN="$HOME/od-$(date +%H%M%S)"
++# Opt-in allocation instrumentation:
++export PYTHONPATH="$PWD/examples/on_policy_distillation_trainer/diagnostics${PYTHONPATH:+:$PYTHONPATH}"
++export OPD_DIAGNOSTIC_DIR="$RUN"
++python3 examples/on_policy_distillation_trainer/diagnostics/guard.py \
++  --log-dir "$RUN" --timeout 600 -- \
++  bash examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh
++```
++
++The guard appends `+ray_kwargs.ray_init._temp_dir=<absolute RUN>/ray` to the
++smoke command and exports `RAY_TMPDIR` and a unique run tag. Do not supply a
++second `_temp_dir` override. Other smoke overrides may follow the script name.
++The log directory may contain parent instrumentation files, but must not contain
++artifacts from an earlier guard run.
++
++Defaults: poll approximately every **1 second**, stop if **MemAvailable <20 GiB**,
++any exposed thermal zone is **>=75 C**, or runtime reaches **600 seconds**.
++Memory and thermal readings are required before launch and on every poll;
++missing/unreadable/invalid readings stop the run. Cgroup-v2 counters are best
++effort. Existing Ray daemons, Ray workers, recognized training launchers, or
++`verl.trainer.*` jobs reject launch rather than mixing workloads.
++
++Artifacts:
++
++- `guard.jsonl`: flushed and fsynced snapshots (wall timestamp, memory/swap,
++  cgroup counters, optional memory PSI, Mlocked/Unevictable/AnonPages/CmaFree/
++  PageTables, all thermal zones, top 15 RSS processes with PPID/starttime/
++  command, tracked identities), cleanup events, final outcome.
++- `smoke.log`: full merged child stdout/stderr, written directly to a file;
++  Python output defaults to unbuffered. Unlike telemetry, this stream is not
++  fsynced each second, so abrupt power loss can lose its tail.
++- `allocations-<PID>.jsonl` (when instrumentation is enabled): model loading,
++  FP8 MoE post-processing, FSDP and vLLM stage boundaries; process/system memory
++  snapshots and CuMem allocator live/peak/cumulative handle sizes. Handle sizes
++  are allocator accounting, not a measurement of physical RSS. Hooks are applied
++  only to this run via `sitecustomize.py`; installed packages are not edited.
++- `control.json`: guardian and child `[PID, /proc starttime]`, run ID and Ray dir.
++  Verify the guardian starttime before sending it `SIGTERM` for a clean stop.
++- `outcome.json`: stop reason, last good snapshot, driver exit code and cleanup
++  status. Exit 0 means successful driver completion and cleanup; 2 means refusal,
++  safety stop or error; 3 means cleanup failed. Check `cleanup.ok` explicitly.
++
++Cleanup runs even on normal driver exit and guardian SIGINT/SIGTERM. It targets
++only recorded PID/starttime identities, descendants, dedicated child-session
++members, or processes with the unique environment tag/Ray directory. Detached
++actors remain tracked after reparenting. TERM has a 5-second grace, then KILL
++has 3 seconds, with rescans to discover late-spawned children. Linux pidfds avoid
++PID-reuse races while signaling (older Python falls back to starttime checks).
++There is no global `ray stop`, `killall`, or kill of unrelated workloads.
++
++Limits: a userspace guard cannot prevent a faster-than-poll OOM, survive its own
++SIGKILL, guarantee signals to uninterruptible kernel tasks, or detect hidden GPU
++hotspots when sysfs exposes only ACPI zones. On eryx all seven exposed zones are
++`acpitz`; the 75 C gate is not a GPU junction-temperature guarantee. A missing
++outcome or `cleanup.ok=false` requires manual review of tagged processes and
++identity verification, not a broad kill command. Commands/RSS of unrelated top
++processes are logged locally, so treat diagnostic artifacts as potentially
++sensitive.
++
++CPU-only validation (no live workload):
++
++```bash
++uv run --no-project --with pytest python -m pytest -q \
++  tests/trainer/test_opd_diagnostic_guard_on_cpu.py
++uv run --no-project python -m py_compile \
++  examples/on_policy_distillation_trainer/diagnostics/guard.py
++```
+diff --git a/examples/on_policy_distillation_trainer/diagnostics/guard.py b/examples/on_policy_distillation_trainer/diagnostics/guard.py
+new file mode 100644
+index 00000000..ff26ecc2
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/diagnostics/guard.py
+@@ -0,0 +1,355 @@
++#!/usr/bin/env python3
++"""Linux-only, dependency-free supervisor for the single-GPU OPD diagnostic run."""
++
++import argparse
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++import uuid
++from pathlib import Path
++
++GIB = 1024**3
++MARKER = "VERL_OPD_GUARD_RUN"
++
++
++def memory_snapshot(proc=Path("/proc")):
++    values = {}
++    for line in (proc / "meminfo").read_text().splitlines():
++        key, value = line.split(":", 1)
++        fields = value.split()
++        values[key] = int(fields[0]) * (1024 if fields[1:] == ["kB"] else 1)
++    if "MemAvailable" not in values:
++        raise ValueError("MemAvailable unavailable")
++    return {
++        key: values.get(key)
++        for key in (
++            "MemAvailable",
++            "MemFree",
++            "MemTotal",
++            "Cached",
++            "Buffers",
++            "Shmem",
++            "SReclaimable",
++            "SwapTotal",
++            "SwapFree",
++            "Mlocked",
++            "Unevictable",
++            "AnonPages",
++            "CmaFree",
++            "PageTables",
++        )
++    }
++
++
++def thermal_snapshot(root=Path("/sys/class/thermal")):
++    zones = []
++    for zone in sorted(root.glob("thermal_zone*")):
++        value = int((zone / "temp").read_text().strip()) / 1000
++        if not -40 <= value <= 150:
++            raise ValueError(f"invalid thermal reading: {zone}: {value}")
++        zones.append({"zone": zone.name, "type": (zone / "type").read_text().strip(), "celsius": value})
++    if not zones:
++        raise ValueError("no thermal zones available")
++    return zones
++
++
++def process_table(proc=Path("/proc")):
++    result = {}
++    for entry in proc.iterdir():
++        if not entry.name.isdigit():
++            continue
++        try:
++            stat = (entry / "stat").read_text()
++            # comm may contain spaces or closing parentheses; stat fields start after the last ')'.
++            fields = stat[stat.rfind(")") + 2 :].split()
++            argv = (entry / "cmdline").read_bytes().split(b"\0")
++            result[int(entry.name)] = {
++                "pid": int(entry.name),
++                "ppid": int(fields[1]),
++                "session": int(fields[3]),
++                "starttime": int(fields[19]),
++                "rss_bytes": max(0, int(fields[21])) * os.sysconf("SC_PAGE_SIZE"),
++                "state": fields[0],
++                "cmd": " ".join(x.decode(errors="replace") for x in argv if x),
++                "argv": [x.decode(errors="replace") for x in argv if x],
++            }
++        except (FileNotFoundError, ProcessLookupError, PermissionError):
++            continue  # ordinary process exit races / unrelated inaccessible processes
++    return result
++
++
++def identity(row):
++    return row["pid"], row["starttime"]
++
++
++def existing_job(row):
++    argv = row["argv"]
++    if not argv:
++        return False
++    name = Path(argv[0]).name
++    return (
++        name in {"raylet", "gcs_server"}
++        or name.startswith("ray::")
++        or any(arg.startswith("verl.trainer.") for arg in argv)
++        or any("vllm.entrypoints" in arg for arg in argv)
++        or any("/ray/_private/" in arg or "/ray/dashboard/" in arg for arg in argv)
++        or any(
++            Path(arg).name in {"run_qwen3_5_single_gpu_smoke.sh", "run_qwen3_5_2b_fsdp.sh"}
++            for arg in argv[1:]
++            if name in {"bash", "sh"}
++        )
++        or name.startswith("VLLM::")
++    )
++
++
++def discover(table, tracked, child_identity, run_id, ray_dir, proc=Path("/proc"), guardian=None):
++    """Retain identities after reparenting; find detached Ray processes by unique run tags."""
++    guardian = os.getpid() if guardian is None else guardian
++    owned = {pid for pid, start in tracked if pid in table and table[pid]["starttime"] == start}
++    child_pid, child_start = child_identity
++    if child_pid in table and table[child_pid]["starttime"] == child_start:
++        owned.add(child_pid)
++    for pid, row in table.items():
++        if pid == guardian:
++            continue
++        tagged = str(ray_dir) in row["cmd"]
++        if not tagged:
++            try:
++                tagged = f"{MARKER}={run_id}".encode() in (proc / str(pid) / "environ").read_bytes().split(b"\0")
++            except (FileNotFoundError, PermissionError, ProcessLookupError):
++                pass
++        # Popen creates a dedicated session. Unlike a process-group kill, enumerate and verify each PID.
++        if tagged or row["session"] == child_pid:
++            owned.add(pid)
++    while True:
++        added = {pid for pid, row in table.items() if row["ppid"] in owned and pid != guardian}
++        if added <= owned:
++            break
++        owned |= added
++    tracked.update(identity(table[pid]) for pid in owned if pid != guardian)
++    return tracked
++
++
++def send_verified(target, sig, proc=Path("/proc"), guardian=None):
++    """Use pidfd when available so PID recycling between check and signal cannot hit a stranger."""
++    pid, start = target
++    guardian = os.getpid() if guardian is None else guardian
++    if pid == guardian or pid <= 1:
++        return False
++    fd = None
++    try:
++        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
++            fd = os.pidfd_open(pid)
++        row = process_table(proc).get(pid)
++        if row is None or row["starttime"] != start or row["state"] == "Z":
++            return False
++        if fd is not None:
++            signal.pidfd_send_signal(fd, sig)
++        else:
++            os.kill(pid, sig)
++        return True
++    except ProcessLookupError:
++        return False
++    finally:
++        if fd is not None:
++            os.close(fd)
++
++
++def stop_reason(snapshot, elapsed, timeout, min_memory, max_temp):
++    if snapshot["memory"]["MemAvailable"] < min_memory:
++        return "low_memavailable"
++    if max(zone["celsius"] for zone in snapshot["thermal"]) >= max_temp:
++        return "thermal_limit"
++    if elapsed >= timeout:
++        return "timeout"
++    return None
++
++
++def cgroup_snapshot(root=Path("/sys/fs/cgroup"), proc=Path("/proc")):
++    try:
++        relative = next(
++            line.split(":", 2)[2] for line in (proc / "self/cgroup").read_text().splitlines() if line.startswith("0::")
++        )
++        base = root / relative.lstrip("/")
++        return {
++            name: (base / name).read_text().strip()
++            for name in ("memory.current", "memory.max", "memory.events", "memory.swap.current")
++            if (base / name).exists()
++        }
++    except (OSError, StopIteration) as exc:
++        return {"error": str(exc)}
++
++
++def emit(handle, value):
++    handle.write(json.dumps(value, sort_keys=True) + "\n")
++    handle.flush()
++    os.fsync(handle.fileno())
++
++
++def pressure_snapshot(proc=Path("/proc")):
++    try:
++        return (proc / "pressure/memory").read_text().strip()
++    except OSError as exc:
++        return {"error": str(exc)}
++
++
++def snapshot(table, tracked):
++    return {
++        "timestamp": time.time(),
++        "memory": memory_snapshot(),
++        "thermal": thermal_snapshot(),
++        "cgroup": cgroup_snapshot(),
++        "memory_pressure": pressure_snapshot(),
++        "top_rss": [
++            {k: v for k, v in row.items() if k != "argv"}
++            for row in sorted(table.values(), key=lambda row: row["rss_bytes"], reverse=True)[:15]
++        ],
++        "tracked": [{"pid": pid, "starttime": start} for pid, start in sorted(tracked)],
++    }
++
++
++def cleanup(tracked, child_identity, run_id, ray_dir, telemetry):
++    errors = []
++    for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 3)):
++        deadline = time.monotonic() + grace
++        while True:
++            table = process_table()
++            discover(table, tracked, child_identity, run_id, ray_dir)
++            alive = [
++                target
++                for target in tracked
++                if target[0] in table
++                and table[target[0]]["starttime"] == target[1]
++                and table[target[0]]["state"] != "Z"
++            ]
++            for target in alive:
++                try:
++                    send_verified(target, sig)
++                except OSError as exc:
++                    errors.append({"pid": target[0], "error": str(exc)})
++            if not alive or time.monotonic() >= deadline:
++                break
++            time.sleep(0.2)
++        emit(telemetry, {"timestamp": time.time(), "event": "cleanup", "signal": sig.name, "alive": alive})
++    table = process_table()
++    discover(table, tracked, child_identity, run_id, ray_dir)
++    remaining = [row for row in table.values() if identity(row) in tracked and row["state"] != "Z"]
++    return {"ok": not remaining and not errors, "remaining": remaining, "errors": errors}
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--log-dir", type=Path, required=True)
++    parser.add_argument("--timeout", type=float, default=600)
++    parser.add_argument("--interval", type=float, default=1)
++    parser.add_argument("--min-mem-gib", type=float, default=20)
++    parser.add_argument("--max-temp-c", type=float, default=75)
++    parser.add_argument("command", nargs=argparse.REMAINDER)
++    args = parser.parse_args(argv)
++    command = args.command[1:] if args.command[:1] == ["--"] else args.command
++    if not command or min(args.interval, args.timeout, args.min_mem_gib) <= 0:
++        parser.error("provide a command after -- and positive interval, timeout, memory limit")
++    logdir = args.log_dir.resolve()
++    logdir.mkdir(parents=True, exist_ok=True)
++    # Refuse reused artifacts, preserving earlier evidence (other instrumentation files are allowed).
++    if any((logdir / name).exists() for name in ("guard.jsonl", "smoke.log", "control.json", "outcome.json", "ray")):
++        parser.error("log directory already contains guard artifacts; use a fresh run directory")
++    telemetry = (logdir / "guard.jsonl").open("x")
++    run_id = uuid.uuid4().hex
++    ray_dir = logdir / "ray"
++    tracked = set()
++    child = None
++    reason = "guard_error"
++    last = None
++    status = {"ok": True, "remaining": [], "errors": []}
++    interrupted = []
++    for sig in (signal.SIGTERM, signal.SIGINT):
++        signal.signal(sig, lambda number, frame: interrupted.append(number))
++    outcome = {"run_id": run_id, "command": command, "ray_temp_dir": str(ray_dir)}
++    try:
++        table = process_table()
++        conflicts = [row for pid, row in table.items() if pid != os.getpid() and existing_job(row)]
++        if conflicts:
++            reason = "existing_jobs"
++            outcome["conflicts"] = conflicts
++            return 2
++        last = snapshot(table, tracked)
++        emit(telemetry, last)
++        reason = stop_reason(last, 0, args.timeout, args.min_mem_gib * GIB, args.max_temp_c)
++        if reason:
++            return 2
++        ray_dir.mkdir(exist_ok=False)
++        command = command + [f"+ray_kwargs.ray_init._temp_dir={ray_dir}"]
++        env = dict(os.environ, **{MARKER: run_id, "RAY_TMPDIR": str(ray_dir)})
++        env.setdefault("PYTHONUNBUFFERED", "1")
++        with (logdir / "smoke.log").open("xb", buffering=0) as output:
++            child = subprocess.Popen(command, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
++            child_identity = (child.pid, -1)  # tags/session still allow cleanup if identity capture fails
++            row = process_table().get(child.pid)
++            if row is None:
++                raise RuntimeError("child disappeared before identity capture")
++            child_identity = identity(row)
++            tracked.add(child_identity)
++            with (logdir / "control.json").open("x") as control:
++                emit(
++                    control,
++                    {
++                        "guardian": identity(process_table()[os.getpid()]),
++                        "child": child_identity,
++                        "run_id": run_id,
++                        "ray_temp_dir": str(ray_dir),
++                    },
++                )
++            start = time.monotonic()
++            while True:
++                table = process_table()
++                discover(table, tracked, child_identity, run_id, ray_dir)
++                last = snapshot(table, tracked)
++                emit(telemetry, last)
++                reason = (
++                    "signal"
++                    if interrupted
++                    else stop_reason(
++                        last, time.monotonic() - start, args.timeout, args.min_mem_gib * GIB, args.max_temp_c
++                    )
++                )
++                if reason:
++                    break
++                if child.poll() is not None:
++                    reason = "child_exit"
++                    break
++                time.sleep(args.interval)
++        return 0 if reason == "child_exit" and child.returncode == 0 else 2
++    except Exception as exc:
++        reason = "monitor_or_guard_error"
++        outcome["error"] = f"{type(exc).__name__}: {exc}"
++        return 2
++    finally:
++        if child is not None:
++            # Even normal driver exit must clean up detached actors. Never kill by global Ray name.
++            try:
++                status = cleanup(tracked, child_identity, run_id, ray_dir, telemetry)
++                child.wait(timeout=1)
++            except Exception as exc:
++                status = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
++        outcome.update(
++            reason=reason,
++            last_snapshot=last,
++            cleanup=status,
++            child_returncode=child.returncode if child else None,
++            timestamp=time.time(),
++        )
++        with (logdir / "outcome.json").open("x") as output:
++            emit(output, outcome)
++        emit(telemetry, {"event": "outcome", **outcome})
++        telemetry.close()
++        # Cleanup failure must not look like a successful run to the caller.
++        if not status["ok"]:
++            sys.exit(3)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/examples/on_policy_distillation_trainer/diagnostics/sitecustomize.py b/examples/on_policy_distillation_trainer/diagnostics/sitecustomize.py
+new file mode 100644
+index 00000000..36b5d052
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/diagnostics/sitecustomize.py
+@@ -0,0 +1,190 @@
++"""Opt-in allocation tracing for one OPD diagnostic run; never imports CUDA eagerly."""
++
++import functools
++import importlib.abc
++import importlib.machinery
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++_ROOT = os.environ.get("OPD_DIAGNOSTIC_DIR")
++_TARGETS = {
++    "vllm.device_allocator.cumem",
++    "vllm.v1.worker.gpu_worker",
++    "vllm.model_executor.model_loader.default_loader",
++    "vllm.model_executor.model_loader.utils",
++    "vllm.model_executor.layers.quantization.fp8",
++    "verl.workers.engine.fsdp.transformer_impl",
++}
++
++
++def _emit(event, **fields):
++    if not _ROOT:
++        return
++    try:
++        root = Path(_ROOT)
++        root.mkdir(parents=True, exist_ok=True)
++        record = {"time": time.time(), "pid": os.getpid(), "event": event, **fields}
++        with (root / f"allocations-{os.getpid()}.jsonl").open("a") as f:
++            f.write(json.dumps(record, default=str) + "\n")
++            f.flush()
++    except Exception:
++        # Instrumentation must not change allocator return values or exceptions.
++        pass
++
++
++def _snapshot():
++    result = {}
++    try:
++        for line in Path("/proc/meminfo").read_text().splitlines():
++            key, value = line.split(":", 1)
++            if key in ("MemAvailable", "MemFree", "Cached", "SwapFree"):
++                result[key + "_bytes"] = int(value.split()[0]) * 1024
++        for line in Path("/proc/self/status").read_text().splitlines():
++            key, _, value = line.partition(":")
++            if key in ("VmRSS", "VmSize", "VmLck", "VmPin", "RssAnon", "RssFile"):
++                result[key + "_bytes"] = int(value.split()[0]) * 1024
++        torch = sys.modules.get("torch")
++        if torch is not None and torch.cuda.is_initialized():
++            result["torch_allocated_bytes"] = torch.cuda.memory_allocated()
++            result["torch_reserved_bytes"] = torch.cuda.memory_reserved()
++            free, total = torch.cuda.mem_get_info()
++            result["cuda_free_bytes"] = free
++            result["cuda_total_bytes"] = total
++    except Exception as error:
++        result["snapshot_error"] = repr(error)
++    return result
++
++
++def _wrap_stage(owner, name, label):
++    original = getattr(owner, name, None)
++    if original is None or getattr(original, "_opd_traced", False):
++        return
++
++    @functools.wraps(original)
++    def traced(*args, **kwargs):
++        model_path = None
++        for obj in args[:3]:
++            config = getattr(obj, "model_config", obj)
++            candidate = getattr(config, "model", None) or getattr(config, "path", None)
++            if isinstance(candidate, str):
++                model_path = candidate
++                break
++        _emit("stage_begin", stage=label, model_path=model_path, memory=_snapshot())
++        try:
++            value = original(*args, **kwargs)
++        except BaseException as error:
++            _emit("stage_error", stage=label, error=repr(error), memory=_snapshot())
++            raise
++        _emit("stage_end", stage=label, memory=_snapshot())
++        return value
++
++    traced._opd_traced = True
++    setattr(owner, name, traced)
++
++
++def _trace_cumem(cls):
++    original_malloc = cls._python_malloc_callback
++    original_free = cls._python_free_callback
++
++    def malloc(self, handle):
++        value = original_malloc(self, handle)
++        state = getattr(self, "_opd_allocation_state", None)
++        if state is None:
++            state = {"live": 0, "peak": 0, "allocated": 0, "freed": 0, "count": 0, "last_logged": 0, "last_time": 0}
++            self._opd_allocation_state = state
++        size = int(handle[1])
++        state["live"] += size
++        state["allocated"] += size
++        state["peak"] = max(state["peak"], state["live"])
++        state["count"] += 1
++        now = time.monotonic()
++        if abs(state["live"] - state["last_logged"]) >= 256 * 1024**2 or now - state["last_time"] >= 2:
++            state["last_logged"] = state["live"]
++            state["last_time"] = now
++            _emit(
++                "cumem_allocation",
++                tag=self.current_tag,
++                allocation_bytes=size,
++                live_handle_bytes=state["live"],
++                peak_handle_bytes=state["peak"],
++                cumulative_allocated_bytes=state["allocated"],
++                cumulative_freed_bytes=state["freed"],
++                allocation_count=state["count"],
++            )
++        return value
++
++    def free(self, ptr):
++        handle = original_free(self, ptr)
++        state = getattr(self, "_opd_allocation_state", None)
++        if state is not None:
++            state["live"] -= int(handle[1])
++            state["freed"] += int(handle[1])
++        return handle
++
++    cls._python_malloc_callback = malloc
++    cls._python_free_callback = free
++    for method in ("sleep", "wake_up", "release_pools"):
++        _wrap_stage(cls, method, "CuMemAllocator." + method)
++
++
++def _patch(module):
++    name = module.__name__
++    try:
++        if name == "vllm.device_allocator.cumem":
++            _trace_cumem(module.CuMemAllocator)
++        elif name == "vllm.v1.worker.gpu_worker":
++            for method in (
++                "init_device",
++                "load_model",
++                "determine_available_memory",
++                "initialize_from_config",
++                "compile_or_warm_up_model",
++            ):
++                _wrap_stage(module.Worker, method, "vLLM.Worker." + method)
++        elif name == "vllm.model_executor.model_loader.default_loader":
++            _wrap_stage(module.DefaultModelLoader, "load_weights", "vLLM.load_weights")
++        elif name == "vllm.model_executor.model_loader.utils":
++            _wrap_stage(module, "process_weights_after_loading", "vLLM.process_weights_after_loading")
++        elif name == "vllm.model_executor.layers.quantization.fp8":
++            _wrap_stage(module.Fp8MoEMethod, "process_weights_after_loading", "FP8.MoE.process_weights_after_loading")
++        elif name == "verl.workers.engine.fsdp.transformer_impl":
++            cls = module.FSDPEngineWithLMHead
++            for method in ("initialize", "_build_model_optimizer", "optimizer_step"):
++                _wrap_stage(cls, method, "FSDP." + method)
++        _emit("instrumentation_installed", module=name)
++    except Exception as error:
++        _emit("instrumentation_error", module=name, error=repr(error))
++
++
++class _TracingLoader:
++    def __init__(self, wrapped):
++        self.wrapped = wrapped
++
++    def create_module(self, spec):
++        method = getattr(self.wrapped, "create_module", None)
++        return method(spec) if method else None
++
++    def exec_module(self, module):
++        self.wrapped.exec_module(module)
++        _patch(module)
++
++    def __getattr__(self, name):
++        return getattr(self.wrapped, name)
++
++
++class _TracingFinder(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname not in _TARGETS:
++            return None
++        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
++        if spec is not None and spec.loader is not None:
++            spec.loader = _TracingLoader(spec.loader)
++        return spec
++
++
++if _ROOT:
++    sys.meta_path.insert(0, _TracingFinder())
++    _emit("python_start", argv=sys.argv)
+diff --git a/examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh b/examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh
+new file mode 100644
+index 00000000..b002798c
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh
+@@ -0,0 +1,69 @@
++#!/usr/bin/env bash
++# One training step on eryx's real single GPU; no dataset/model downloads.
++set -euo pipefail
++cd "$(dirname "$0")/../.."
++export VERL_USE_UV=0 DEVICE=gpu INFER_BACKEND=vllm
++export VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_WORKER_MULTIPROC_METHOD=spawn
++export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
++export TOKENIZERS_PARALLELISM=false
++export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-/home/eryx/verl-install/opd-preflight/vllm-cache}
++export STUDENT_MODEL=${STUDENT_MODEL:-/home/eryx/models/Qwen3.5-2B}
++export TEACHER_MODEL=${TEACHER_MODEL:-/home/eryx/models/Qwen3.5-35B-A3B-FP8}
++for model in "$STUDENT_MODEL" "$TEACHER_MODEL"; do
++    test -d "$model" || { echo "Missing local model: $model" >&2; exit 1; }
++done
++mkdir -p logs/single_gpu_opd_smoke
++export TRAIN_FILE="$PWD/logs/single_gpu_opd_smoke/train.parquet"
++export VAL_FILE="$TRAIN_FILE"
++python3 - <<'PY'
++import os
++import pandas as pd
++rows = [dict(data_source='openai/gsm8k',
++             prompt=[dict(role='user', content='What is 1+1? Give the final answer after ####.')],
++             ability='math', reward_model=dict(style='rule', ground_truth='2'),
++             extra_info=dict(split='train', index=i)) for i in range(2)]
++pd.DataFrame(rows).to_parquet(os.environ['TRAIN_FILE'])
++PY
++export NNODES=1 NGPUS_PER_NODE=1 TEACHER_WORLD_SIZE=1
++export TRAIN_BATCH_SIZE=2 PPO_MINI_BATCH_SIZE=2
++export MAX_PROMPT_LENGTH=128 MAX_RESPONSE_LENGTH=16 PPO_MAX_TOKEN_LEN_PER_GPU=256
++export ROLLOUT_TP=1 TEACHER_TP=1 TEACHER_EP=1
++# Fixed KV budgets below avoid allocating a utilization-sized cache. Utilization
++# still controls vLLM's startup free-memory check; do not use the multi-GPU defaults.
++export ROLLOUT_GPU_MEM_UTIL=0.15 TEACHER_GPU_MEM_UTIL=0.35
++export TOTAL_EPOCHS=1 SAVE_FREQ=-1 TEST_FREQ=-1
++export USE_POLICY_GRADIENT=True DISTILLATION_LOSS_MODE=k1
++export PROJECT_NAME=single_gpu_opd_smoke EXPERIMENT_NAME=qwen3_5_2b_from_35b_fp8
++bash examples/on_policy_distillation_trainer/run_qwen3_5_2b_fsdp.sh \
++    distillation.share_student_resource_pool=True \
++    actor_rollout_ref.model.use_remove_padding=False \
++    +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
++    actor_rollout_ref.actor.fsdp_config.param_offload=False \
++    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
++    'actor_rollout_ref.actor.optim.override_optimizer_config={foreach:False}' \
++    reward.num_workers=1 \
++    distillation.teacher_models.teacher_model.inference.free_cache_engine=False \
++    +distillation.teacher_models.teacher_model.inference.enable_sleep_mode=False \
++    distillation.teacher_models.teacher_model.inference.enforce_eager=True \
++    distillation.teacher_models.teacher_model.inference.max_num_seqs=2 \
++    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=256 \
++    +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.kv_cache_memory_bytes=536870912 \
++    '+distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.limit_mm_per_prompt={image:0,video:0}' \
++    +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.skip_mm_profiling=True \
++    actor_rollout_ref.rollout.enforce_eager=True \
++    +actor_rollout_ref.rollout.enable_sleep_mode=True \
++    actor_rollout_ref.rollout.free_cache_engine=True \
++    actor_rollout_ref.rollout.max_num_seqs=2 \
++    actor_rollout_ref.rollout.max_num_batched_tokens=256 \
++    actor_rollout_ref.rollout.agent.num_workers=1 \
++    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=268435456 \
++    '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:0,video:0}' \
++    +actor_rollout_ref.rollout.engine_kwargs.vllm.skip_mm_profiling=True \
++    data.dataloader_num_workers=0 \
++    trainer.total_training_steps=1 \
++    trainer.logger='["console"]' \
++    trainer.resume_mode=disable \
++    +ray_kwargs.ray_init.object_store_memory=268435456 \
++    +ray_kwargs.ray_init.include_dashboard=False \
++    ray_kwargs.ray_init.num_cpus=12 \
++    "$@"
+diff --git a/tests/single_controller/test_shared_teacher_pool_on_cpu.py b/tests/single_controller/test_shared_teacher_pool_on_cpu.py
+new file mode 100644
+index 00000000..0489a03b
+--- /dev/null
++++ b/tests/single_controller/test_shared_teacher_pool_on_cpu.py
+@@ -0,0 +1,51 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Shared placement reuses bundles, not extra (or fictitious) GPU resources."""
++
++from unittest.mock import MagicMock
++
++import pytest
++
++pytest.importorskip("torch")
++pytest.importorskip("ray")
++from verl.single_controller.ray.base import RayWorkerGroup, ResourcePoolManager, split_resource_pool
++
++
++def test_teacher_nested_slices_keep_student_placement_and_fractional_claims(monkeypatch):
++    import verl.single_controller.ray.base as base
++
++    monkeypatch.setattr(base.ray._private.state, "available_resources_per_node", lambda: {"node": {"GPU": 1}})
++    manager = ResourcePoolManager({"global_pool": [1]}, {"student": "global_pool", "teacher": "global_pool"})
++    manager.create_resource_pool()
++    assert manager.get_n_gpus() == 1
++    student = manager.get_resource_pool("student")
++    assert manager.get_resource_pool("teacher") is student
++    pg = MagicMock()
++    student.pgs = [pg]
++    # MultiTeacherModelManager splits once, TeacherModelManager splits a second time.
++    teacher = split_resource_pool(split_resource_pool(student, [1])[0], 1)[0]
++    assert teacher.pgs is student.pgs
++    assert teacher.start_bundle_index == 0
++    assert teacher.max_colocate_count == student.max_colocate_count == 3
++
++    claims = []
++    for rank, pool in enumerate((student, teacher)):
++        group = MagicMock()
++        group.use_gpu = True
++        group.name_prefix = f"test_{rank}"
++        group.device_name = "cuda"
++        group.profile_steps = None
++        group._workers = []
++        group._worker_names = []
++        group._master_addr = "localhost"
++        group._master_port = "12345"
++        cls = MagicMock()
++        RayWorkerGroup._create_worker(group, 0, 0, pg, 0, pool, cls, None, False)
++        claim = cls.call_args.kwargs
++        assert claim["placement_group"] is pg
++        assert claim["placement_group_bundle_idx"] == 0
++        assert claim["num_gpus"] == pytest.approx(1 / 3)
++        claims.append(claim["num_gpus"])
++    assert sum(claims) < 1  # no bundle overclaim; one slot remains for a hybrid checkpoint worker
+diff --git a/tests/trainer/test_opd_allocation_trace_on_cpu.py b/tests/trainer/test_opd_allocation_trace_on_cpu.py
+new file mode 100644
+index 00000000..4fbc4085
+--- /dev/null
++++ b/tests/trainer/test_opd_allocation_trace_on_cpu.py
+@@ -0,0 +1,66 @@
++"""Diagnostic hooks preserve wrapped behavior and do not import CUDA eagerly."""
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++
++_PATH = Path(__file__).parents[2] / "examples/on_policy_distillation_trainer/diagnostics/sitecustomize.py"
++
++
++def load_trace():
++    spec = importlib.util.spec_from_file_location("opd_allocation_trace", _PATH)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_allocator_hooks_preserve_handles_and_account_live_bytes():
++    module = load_trace()
++
++    class Allocator:
++        def __init__(self):
++            self.current_tag = "weights"
++            self.pointer_to_data = {}
++
++        def _python_malloc_callback(self, handle):
++            self.pointer_to_data[handle[2]] = handle
++
++        def _python_free_callback(self, pointer):
++            return self.pointer_to_data.pop(pointer)
++
++    module._trace_cumem(Allocator)
++    allocator = Allocator()
++    first, second = (0, 1024, 1, []), (0, 2048, 2, [])
++    assert allocator._python_malloc_callback(first) is None
++    allocator._python_malloc_callback(second)
++    assert allocator._opd_allocation_state["live"] == 3072
++    assert allocator._python_free_callback(1) == first
++    assert allocator._opd_allocation_state["live"] == 2048
++    assert allocator._python_free_callback(2) == second
++    assert allocator._opd_allocation_state["live"] == 0
++    assert allocator._opd_allocation_state["peak"] == 3072
++
++
++def test_stage_hooks_preserve_return_and_exception(monkeypatch):
++    module = load_trace()
++    events = []
++    monkeypatch.setattr(module, "_emit", lambda event, **fields: events.append((event, fields)))
++    monkeypatch.setattr(module, "_snapshot", lambda: {})
++
++    class Stage:
++        def method(self, value):
++            return value + 1
++
++        def fail(self):
++            raise RuntimeError("original error")
++
++    module._wrap_stage(Stage, "method", "test.method")
++    wrapped = Stage.method
++    module._wrap_stage(Stage, "method", "test.method")
++    assert Stage.method is wrapped
++    assert Stage().method(2) == 3
++    module._wrap_stage(Stage, "fail", "test.fail")
++    with pytest.raises(RuntimeError, match="original error"):
++        Stage().fail()
++    assert [event for event, _ in events] == ["stage_begin", "stage_end", "stage_begin", "stage_error"]
+diff --git a/tests/trainer/test_opd_diagnostic_guard_on_cpu.py b/tests/trainer/test_opd_diagnostic_guard_on_cpu.py
+new file mode 100644
+index 00000000..9487e122
+--- /dev/null
++++ b/tests/trainer/test_opd_diagnostic_guard_on_cpu.py
+@@ -0,0 +1,197 @@
++"""No GPU, Ray import, live training, or real process signals."""
++
++import importlib.util
++import json
++import signal
++from pathlib import Path
++
++import pytest
++
++PATH = Path(__file__).resolve().parents[2] / "examples/on_policy_distillation_trainer/diagnostics/guard.py"
++spec = importlib.util.spec_from_file_location("opd_guard", PATH)
++guard = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(guard)
++
++
++def proc_row(root, pid, ppid=1, start=50, session=10, rss=5, argv=("python",)):
++    directory = root / str(pid)
++    directory.mkdir(exist_ok=True)
++    fields = ["0"] * 22
++    fields[0], fields[1], fields[3], fields[19], fields[21] = "S", str(ppid), str(session), str(start), str(rss)
++    (directory / "stat").write_text(f"{pid} (name with ) space) " + " ".join(fields))
++    (directory / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv))
++    (directory / "environ").write_bytes(b"")
++
++
++def test_sensors_and_boundaries(tmp_path):
++    (tmp_path / "meminfo").write_text("MemAvailable: 20971520 kB\nSwapTotal: 100 kB\nSwapFree: 40 kB\n")
++    zone = tmp_path / "thermal_zone0"
++    zone.mkdir()
++    (zone / "type").write_text("acpitz\n")
++    (zone / "temp").write_text("40000\n")
++    snapshot = {"memory": guard.memory_snapshot(tmp_path), "thermal": guard.thermal_snapshot(tmp_path)}
++    assert snapshot["memory"]["MemAvailable"] == 20 * guard.GIB
++    assert snapshot["memory"]["SwapFree"] == 40960
++    assert snapshot["thermal"][0]["type"] == "acpitz"
++    assert guard.stop_reason(snapshot, 0, 600, 20 * guard.GIB, 75) is None
++    assert guard.stop_reason(snapshot, 600, 600, 20 * guard.GIB, 75) == "timeout"
++    snapshot["memory"]["MemAvailable"] -= 1
++    assert guard.stop_reason(snapshot, 0, 600, 20 * guard.GIB, 75) == "low_memavailable"
++    snapshot["memory"]["MemAvailable"] += 1
++    snapshot["thermal"][0]["celsius"] = 75
++    assert guard.stop_reason(snapshot, 0, 600, 20 * guard.GIB, 75) == "thermal_limit"
++
++
++def test_missing_and_broken_sensors_fail_closed(tmp_path):
++    with pytest.raises(ValueError, match="no thermal"):
++        guard.thermal_snapshot(tmp_path)
++    (tmp_path / "meminfo").write_text("MemTotal: 100 kB\n")
++    with pytest.raises(ValueError, match="MemAvailable"):
++        guard.memory_snapshot(tmp_path)
++    zone = tmp_path / "thermal_zone0"
++    zone.mkdir()
++    (zone / "temp").write_text("not a number")
++    with pytest.raises(ValueError):
++        guard.thermal_snapshot(tmp_path)
++
++
++def test_discovery_reparenting_pid_reuse_and_guard_exclusion(tmp_path):
++    proc_row(tmp_path, 10, session=10)
++    proc_row(tmp_path, 11, ppid=10, session=99)
++    proc_row(tmp_path, 12, session=99, argv=("raylet", "--temp-dir=/unique/ray"))
++    proc_row(tmp_path, 13, session=99)
++    (tmp_path / "13/environ").write_bytes(b"VERL_OPD_GUARD_RUN=token\0")
++    proc_row(tmp_path, 14, session=99)
++    proc_row(tmp_path, 20, session=10)
++    tracked = {(14, 49)}  # reused PID is not owned
++    guard.discover(guard.process_table(tmp_path), tracked, (10, 50), "token", Path("/unique/ray"), tmp_path, 20)
++    assert tracked == {(10, 50), (11, 50), (12, 50), (13, 50), (14, 49)}
++    proc_row(tmp_path, 11, ppid=1, session=99)
++    guard.discover(guard.process_table(tmp_path), tracked, (10, 50), "token", Path("/unique/ray"), tmp_path, 20)
++    assert (11, 50) in tracked
++    assert guard.process_table(tmp_path)[11]["rss_bytes"] == 5 * guard.os.sysconf("SC_PAGE_SIZE")
++
++
++def test_signals_only_matching_identity_not_guardian(tmp_path, monkeypatch):
++    proc_row(tmp_path, 10)
++    calls = []
++    monkeypatch.delattr(guard.os, "pidfd_open", raising=False)
++    monkeypatch.setattr(guard.os, "kill", lambda pid, sig: calls.append((pid, sig)))
++    assert not guard.send_verified((10, 49), signal.SIGTERM, tmp_path, 20)
++    assert not guard.send_verified((10, 50), signal.SIGTERM, tmp_path, 10)
++    assert guard.send_verified((10, 50), signal.SIGTERM, tmp_path, 20)
++    assert calls == [(10, signal.SIGTERM)]
++
++
++def test_cleanup_term_then_kill_only_owned(monkeypatch, tmp_path):
++    proc_row(tmp_path, 10)
++    proc_row(tmp_path, 11, session=99)
++    table = guard.process_table(tmp_path)
++    monkeypatch.setattr(guard, "process_table", lambda: table)
++    monkeypatch.setattr(guard, "discover", lambda *args: None)
++    clock = iter([0, 6, 10, 14])
++    monkeypatch.setattr(guard.time, "monotonic", lambda: next(clock))
++    calls = []
++
++    def send(target, sig):
++        calls.append((target, sig))
++        if sig == signal.SIGKILL:
++            table.pop(target[0])
++
++    monkeypatch.setattr(guard, "send_verified", send)
++    monkeypatch.setattr(guard.time, "sleep", lambda seconds: None)
++    with (tmp_path / "log").open("w") as output:
++        result = guard.cleanup({(10, 50), (11, 49)}, (10, 50), "token", Path("/unique"), output)
++    assert result["ok"]
++    assert calls == [((10, 50), signal.SIGTERM), ((10, 50), signal.SIGKILL)]
++    assert 11 in table
++
++
++@pytest.mark.parametrize(
++    "argv",
++    [
++        ("raylet",),
++        ("gcs_server",),
++        ("ray::Worker",),
++        ("python", "-m", "verl.trainer.main_ppo"),
++        ("python", "/opt/ray/dashboard/dashboard.py"),
++        ("bash", "run_qwen3_5_single_gpu_smoke.sh"),
++    ],
++)
++def test_existing_job_rejection(argv):
++    assert guard.existing_job({"argv": argv})
++
++
++def test_monitor_failure_prevents_launch_and_records_outcome(tmp_path, monkeypatch):
++    monkeypatch.setattr(guard, "process_table", lambda: {})
++    monkeypatch.setattr(guard, "memory_snapshot", lambda: (_ for _ in ()).throw(OSError("sensor failed")))
++    monkeypatch.setattr(guard.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not launch"))
++    assert guard.main(["--log-dir", str(tmp_path), "--", "bash", "smoke.sh"]) == 2
++    outcome = json.loads((tmp_path / "outcome.json").read_text())
++    assert outcome["reason"] == "monitor_or_guard_error"
++    assert "sensor failed" in outcome["error"]
++
++
++def test_monitor_failure_after_launch_cleans_child(tmp_path, monkeypatch):
++    row = {
++        "pid": 100,
++        "ppid": 1,
++        "session": 100,
++        "starttime": 50,
++        "rss_bytes": 0,
++        "state": "S",
++        "argv": ["bash"],
++        "cmd": "bash",
++    }
++    monkeypatch.setattr(guard, "process_table", lambda: {100: row, guard.os.getpid(): dict(row, pid=guard.os.getpid())})
++    monkeypatch.setattr(guard, "memory_snapshot", lambda: {"MemAvailable": 21 * guard.GIB})
++    calls = []
++
++    def thermal():
++        if calls:
++            raise OSError("lost thermal sensor")
++        calls.append("preflight")
++        return [{"celsius": 40}]
++
++    monkeypatch.setattr(guard, "thermal_snapshot", thermal)
++
++    class Child:
++        pid = 100
++        returncode = None
++
++        def wait(self, timeout):
++            self.returncode = -15
++
++    def launch(command, **kwargs):
++        assert command[-1] == f"+ray_kwargs.ray_init._temp_dir={tmp_path}/ray"
++        assert kwargs["start_new_session"]
++        assert guard.MARKER in kwargs["env"]
++        return Child()
++
++    def cleanup(tracked, child_identity, *args):
++        assert child_identity == (100, 50)
++        assert child_identity in tracked
++        calls.append("cleanup")
++        return {"ok": True}
++
++    monkeypatch.setattr(guard.subprocess, "Popen", launch)
++    monkeypatch.setattr(guard, "cleanup", cleanup)
++    assert guard.main(["--log-dir", str(tmp_path), "--", "bash", "smoke.sh"]) == 2
++    assert calls == ["preflight", "cleanup"]
++    outcome = json.loads((tmp_path / "outcome.json").read_text())
++    assert outcome["reason"] == "monitor_or_guard_error"
++    assert outcome["cleanup"]["ok"]
++
++
++def test_optional_pressure_and_extra_memory_fields(tmp_path):
++    (tmp_path / "meminfo").write_text(
++        "MemAvailable: 10 kB\nMemFree: 4 kB\nCached: 6 kB\nMlocked: 2 kB\nUnevictable: 3 kB\n"
++    )
++    assert guard.memory_snapshot(tmp_path)["MemFree"] == 4096
++    assert guard.memory_snapshot(tmp_path)["Cached"] == 6144
++    assert guard.memory_snapshot(tmp_path)["Mlocked"] == 2048
++    assert guard.memory_snapshot(tmp_path)["CmaFree"] is None
++    assert "error" in guard.pressure_snapshot(tmp_path)
++    (tmp_path / "pressure").mkdir()
++    (tmp_path / "pressure/memory").write_text("some avg10=0.00 total=123\n")
++    assert guard.pressure_snapshot(tmp_path) == "some avg10=0.00 total=123"
+diff --git a/tests/trainer/test_resident_teacher_distillation_config_on_cpu.py b/tests/trainer/test_resident_teacher_distillation_config_on_cpu.py
+new file mode 100644
+index 00000000..282aee90
+--- /dev/null
++++ b/tests/trainer/test_resident_teacher_distillation_config_on_cpu.py
+@@ -0,0 +1,56 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Exercise the runtime dataclass validator, not just placement policy."""
++
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("torch")
++pytest.importorskip("transformers")
++
++from verl.workers.config.distillation import DistillationConfig, DistillationTeacherModelConfig
++from verl.workers.config.rollout import RolloutConfig
++
++
++def build_config(*, shared, sleep, free_cache):
++    return DistillationConfig(
++        enabled=True,
++        share_student_resource_pool=shared,
++        nnodes=1,
++        n_gpus_per_node=1,
++        # Isolate lifecycle validation from the unrelated loss/dataset registry.
++        distillation_loss=SimpleNamespace(loss_settings=SimpleNamespace(use_topk=False), topk=None),
++        teacher_models={
++            "teacher_model": DistillationTeacherModelConfig(
++                key="testteacher",
++                model_path="/unused/test-teacher",
++                inference=RolloutConfig(
++                    name="vllm",
++                    tensor_model_parallel_size=1,
++                    enable_sleep_mode=sleep,
++                    free_cache_engine=free_cache,
++                ),
++            )
++        },
++    )
++
++
++def test_runtime_config_accepts_resident_teacher_without_sleep_pool():
++    cfg = build_config(shared=True, sleep=False, free_cache=False)
++    inference = next(iter(cfg.teacher_models.values())).inference
++    assert inference.enable_sleep_mode is False
++    assert inference.free_cache_engine is False
++
++
++@pytest.mark.parametrize("sleep,free_cache", [(True, False), (False, True), (True, True)])
++def test_runtime_config_rejects_unsafe_shared_teacher_lifecycle(sleep, free_cache):
++    with pytest.raises(ValueError, match="enable_sleep_mode=false"):
++        build_config(shared=True, sleep=sleep, free_cache=free_cache)
++
++
++def test_default_separate_teacher_sleep_behavior_is_unchanged():
++    cfg = build_config(shared=False, sleep=True, free_cache=True)
++    assert next(iter(cfg.teacher_models.values())).inference.enable_sleep_mode is True
+diff --git a/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py b/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
+new file mode 100644
+index 00000000..2e46d14b
+--- /dev/null
++++ b/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
+@@ -0,0 +1,137 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Placement policy is dependency-light: exercise it without importing torch/Ray."""
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++from omegaconf import OmegaConf
++
++_spec = importlib.util.spec_from_file_location(
++    "distillation_resource_pool", Path(__file__).parents[2] / "verl/trainer/distillation/resource_pool.py"
++)
++_module = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(_module)
++teacher_resource_pool_id = _module.teacher_resource_pool_id
++
++
++def config():
++    inference = dict(
++        name="vllm",
++        enforce_eager=True,
++        enable_sleep_mode=True,
++        free_cache_engine=True,
++        tensor_model_parallel_size=1,
++        data_parallel_size=1,
++        pipeline_model_parallel_size=1,
++        expert_parallel_size=1,
++        engine_kwargs=dict(vllm=dict(kv_cache_memory_bytes=268435456)),
++    )
++    cfg = OmegaConf.create(
++        dict(
++            trainer=dict(nnodes=1, n_gpus_per_node=1),
++            algorithm=dict(adv_estimator="grpo", use_kl_in_reward=False),
++            reward=dict(reward_model=dict(enable=False)),
++            actor_rollout_ref=dict(
++                hybrid_engine=True, actor=dict(strategy="fsdp2", use_kl_loss=False), rollout=inference
++            ),
++            distillation=dict(
++                share_student_resource_pool=True,
++                nnodes=1,
++                n_gpus_per_node=1,
++                teacher_models=dict(teacher_model=dict(inference=inference)),
++            ),
++        )
++    )
++    cfg.distillation.teacher_models.teacher_model.inference.free_cache_engine = False
++    cfg.distillation.teacher_models.teacher_model.inference.enable_sleep_mode = False
++    return cfg
++
++
++def test_shared_pool_is_the_actual_student_pool():
++    assert teacher_resource_pool_id(config()) == "global_pool"
++
++
++def test_default_does_not_validate_or_change_separate_pool():
++    assert teacher_resource_pool_id(OmegaConf.create({"distillation": {}})) == "teacher_pool"
++
++
++@pytest.mark.parametrize(
++    "prefix,value,expected",
++    [
++        ("actor_rollout_ref.rollout", False, "student enable_sleep_mode must be true"),
++        ("distillation.teacher_models.teacher_model.inference", True, "teacher enable_sleep_mode must be false"),
++    ],
++)
++def test_shared_pool_requires_student_sleep_but_resident_teacher_no_sleep(prefix, value, expected):
++    cfg = config()
++    OmegaConf.update(cfg, f"{prefix}.enable_sleep_mode", value)
++    with pytest.raises(ValueError, match=expected):
++        teacher_resource_pool_id(cfg)
++
++
++def test_resident_teacher_must_explicitly_disable_default_sleep_mode():
++    cfg = config()
++    del cfg.distillation.teacher_models.teacher_model.inference.enable_sleep_mode
++    with pytest.raises(ValueError, match="teacher enable_sleep_mode must be false"):
++        teacher_resource_pool_id(cfg)
++
++
++@pytest.mark.parametrize(
++    "path,value",
++    [
++        ("trainer.n_gpus_per_node", 2),
++        ("trainer.nnodes", 2),
++        ("distillation.n_gpus_per_node", 2),
++        ("distillation.nnodes", 2),
++        ("actor_rollout_ref.hybrid_engine", False),
++        ("actor_rollout_ref.actor.strategy", "megatron"),
++        ("actor_rollout_ref.actor.use_kl_loss", True),
++        ("algorithm.use_kl_in_reward", True),
++        ("algorithm.adv_estimator", "gae"),
++        ("reward.reward_model.enable", True),
++        ("reward.reward_model.enable_resource_pool", True),
++        ("distillation.teacher_models.teacher_model.num_replicas", 2),
++        ("distillation.teacher_models.teacher_model.inference.free_cache_engine", True),
++        ("actor_rollout_ref.rollout.free_cache_engine", False),
++        ("distillation.teacher_models.other", {}),
++    ],
++)
++def test_unsupported_topologies_fail_before_launch(path, value):
++    cfg = config()
++    OmegaConf.update(cfg, path, value)
++    with pytest.raises(ValueError, match="share_student_resource_pool"):
++        teacher_resource_pool_id(cfg)
++
++
++@pytest.mark.parametrize("prefix", ["actor_rollout_ref.rollout", "distillation.teacher_models.teacher_model.inference"])
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("name", "sglang"),
++        ("enforce_eager", False),
++        ("tensor_model_parallel_size", 2),
++        ("data_parallel_size", 2),
++        ("pipeline_model_parallel_size", 2),
++        ("expert_parallel_size", 2),
++        ("engine_kwargs.vllm.kv_cache_memory_bytes", None),
++        ("engine_kwargs.vllm.kv_cache_memory_bytes", 0),
++        ("engine_kwargs.vllm.kv_cache_memory_bytes", True),
++        ("engine_kwargs.vllm.enable_sleep_mode", False),
++        ("engine_kwargs.vllm.enable-sleep-mode", True),
++        ("engine_kwargs.vllm.no-enable-sleep-mode", True),
++        ("engine_kwargs.vllm.no_enable_sleep_mode", True),
++        ("engine_kwargs.vllm.tensor_parallel_size", 2),
++        ("engine_kwargs.vllm.tensor-parallel-size", 2),
++        ("engine_kwargs.vllm.no-enforce-eager", True),
++        ("engine_kwargs.vllm.kv-cache-memory-bytes", 107374182400),
++    ],
++)
++def test_both_engines_require_bounded_safe_settings(prefix, field, value):
++    cfg = config()
++    OmegaConf.update(cfg, f"{prefix}.{field}", value)
++    with pytest.raises(ValueError, match="share_student_resource_pool"):
++        teacher_resource_pool_id(cfg)
+diff --git a/tests/workers/rollout/test_vllm_resident_wake_up_on_cpu.py b/tests/workers/rollout/test_vllm_resident_wake_up_on_cpu.py
+new file mode 100644
+index 00000000..0a979287
+--- /dev/null
++++ b/tests/workers/rollout/test_vllm_resident_wake_up_on_cpu.py
+@@ -0,0 +1,166 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Execute the real wake/sleep methods without importing the GPU-only vLLM stack."""
++
++import ast
++import asyncio
++import logging
++from enum import Enum
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock, call
++
++import pytest
++
++
++@pytest.fixture(scope="module")
++def server_methods():
++    rollout_dir = Path(__file__).resolve().parents[3] / "verl/workers/rollout"
++    replica_path = rollout_dir / "replica.py"
++    replica_tree = ast.parse(replica_path.read_text(encoding="utf-8"))
++    rollout_mode = next(
++        node for node in replica_tree.body if isinstance(node, ast.ClassDef) and node.name == "RolloutMode"
++    )
++
++    server_path = rollout_dir / "vllm_rollout/vllm_async_server.py"
++    server_tree = ast.parse(server_path.read_text(encoding="utf-8"))
++    server_class = next(
++        node for node in server_tree.body if isinstance(node, ast.ClassDef) and node.name == "vLLMHttpServer"
++    )
++    methods = [
++        node
++        for node in server_class.body
++        if isinstance(node, ast.AsyncFunctionDef) and node.name in {"wake_up", "sleep"}
++    ]
++    assert {node.name for node in methods} == {"wake_up", "sleep"}
++    namespace = {"Enum": Enum, "logger": logging.getLogger(__name__)}
++    # Compile unchanged production AST nodes, not a copy of the method logic.
++    exec(compile(ast.Module(body=[rollout_mode, *methods], type_ignores=[]), str(server_path), "exec"), namespace)
++    return SimpleNamespace(**namespace)
++
++
++def make_server(methods, mode, *, enable_sleep_mode=True, free_cache_engine=True, node_rank=0):
++    engine = Mock(wake_up=AsyncMock(), reset_prefix_cache=AsyncMock(), sleep=AsyncMock())
++    return SimpleNamespace(
++        node_rank=node_rank,
++        rollout_mode=getattr(methods.RolloutMode, mode),
++        config=SimpleNamespace(enable_sleep_mode=enable_sleep_mode, free_cache_engine=free_cache_engine),
++        engine=engine,
++        _get_wake_up_tags=Mock(return_value=["weights", "kv_cache"]),
++        _sleep_hybrid=AsyncMock(),
++    )
++
++
++def test_resident_teacher_resets_prefix_without_engine_wake_or_sleep(server_methods):
++    server = make_server(server_methods, "COLOCATED", enable_sleep_mode=False, free_cache_engine=False)
++
++    asyncio.run(server_methods.wake_up(server))
++    asyncio.run(server_methods.sleep(server))
++
++    assert server.engine.mock_calls == [call.reset_prefix_cache(reset_connector=True)]
++    server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
++    server.engine.wake_up.assert_not_awaited()
++    server.engine.sleep.assert_not_awaited()
++    server._get_wake_up_tags.assert_not_called()
++
++
++@pytest.mark.parametrize("free_cache_engine", [False, True])
++@pytest.mark.parametrize("enable_sleep_mode", [False, True])
++def test_colocated_wake_respects_sleep_mode_and_keeps_cache_reset(server_methods, free_cache_engine, enable_sleep_mode):
++    server = make_server(
++        server_methods,
++        "COLOCATED",
++        enable_sleep_mode=enable_sleep_mode,
++        free_cache_engine=free_cache_engine,
++    )
++
++    asyncio.run(server_methods.wake_up(server, tags=["custom"]))
++
++    expected_calls = [call.reset_prefix_cache(reset_connector=True)]
++    if enable_sleep_mode:
++        expected_calls.insert(0, call.wake_up(tags=["weights", "kv_cache"]))
++        server.engine.wake_up.assert_awaited_once_with(tags=["weights", "kv_cache"])
++        server._get_wake_up_tags.assert_called_once_with()
++    else:
++        server.engine.wake_up.assert_not_awaited()
++        server._get_wake_up_tags.assert_not_called()
++    assert server.engine.mock_calls == expected_calls
++    server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
++
++
++@pytest.mark.parametrize("enable_sleep_mode", [False, True])
++@pytest.mark.parametrize("tags", [None, [], ["custom"]])
++def test_hybrid_wake_and_tags_are_unchanged(server_methods, enable_sleep_mode, tags):
++    server = make_server(server_methods, "HYBRID", enable_sleep_mode=enable_sleep_mode)
++
++    asyncio.run(server_methods.wake_up(server, tags=tags))
++
++    expected_tags = tags or ["weights", "kv_cache"]
++    assert server.engine.mock_calls == [
++        call.wake_up(tags=expected_tags),
++        call.reset_prefix_cache(reset_connector=True),
++    ]
++    server.engine.wake_up.assert_awaited_once_with(tags=expected_tags)
++    server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
++    assert server._get_wake_up_tags.call_count == (0 if tags else 1)
++
++
++@pytest.mark.parametrize("mode", ["HYBRID", "COLOCATED", "STANDALONE"])
++@pytest.mark.parametrize("enable_sleep_mode", [False, True])
++@pytest.mark.parametrize("free_cache_engine", [False, True])
++def test_nonleader_wake_and_sleep_are_noops(server_methods, mode, enable_sleep_mode, free_cache_engine):
++    server = make_server(
++        server_methods,
++        mode,
++        enable_sleep_mode=enable_sleep_mode,
++        free_cache_engine=free_cache_engine,
++        node_rank=1,
++    )
++
++    asyncio.run(server_methods.wake_up(server))
++    asyncio.run(server_methods.sleep(server))
++
++    assert server.engine.mock_calls == []
++    server._get_wake_up_tags.assert_not_called()
++    server._sleep_hybrid.assert_not_awaited()
++
++
++@pytest.mark.parametrize("enable_sleep_mode", [False, True])
++def test_standalone_wake_and_sleep_are_noops(server_methods, enable_sleep_mode):
++    server = make_server(server_methods, "STANDALONE", enable_sleep_mode=enable_sleep_mode)
++
++    asyncio.run(server_methods.wake_up(server))
++    asyncio.run(server_methods.sleep(server))
++
++    assert server.engine.mock_calls == []
++    server._get_wake_up_tags.assert_not_called()
++    server._sleep_hybrid.assert_not_awaited()
++
++
++@pytest.mark.parametrize("mode", ["HYBRID", "COLOCATED"])
++@pytest.mark.parametrize("free_cache_engine", [False, True])
++def test_existing_sleep_behavior_is_unchanged(server_methods, mode, free_cache_engine):
++    server = make_server(server_methods, mode, free_cache_engine=free_cache_engine)
++
++    asyncio.run(server_methods.sleep(server))
++
++    if not free_cache_engine:
++        assert server.engine.mock_calls == []
++        server._sleep_hybrid.assert_not_awaited()
++    elif mode == "HYBRID":
++        server._sleep_hybrid.assert_awaited_once_with()
++        assert server.engine.mock_calls == []
++    else:
++        server.engine.sleep.assert_awaited_once_with(level=1)
++        assert server.engine.mock_calls == [call.sleep(level=1)]
+diff --git a/verl/trainer/distillation/resource_pool.py b/verl/trainer/distillation/resource_pool.py
+new file mode 100644
+index 00000000..3dbf63c8
+--- /dev/null
++++ b/verl/trainer/distillation/resource_pool.py
+@@ -0,0 +1,85 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Resource placement policy for the experimental single-GPU resident teacher."""
++
++
++def teacher_resource_pool_id(config):
++    """Validate the opt-in topology before actors are launched, and select its pool.
++
++    This deliberately supports only one FSDP hybrid student and one vLLM teacher.
++    Reusing the *same* pool (including its placement group) lets RayWorkerGroup's
++    fractional GPU reservations share a real device; creating a second pool would
++    reserve a second GPU regardless of the actors' fractional reservations.
++    """
++    distillation = config.distillation
++    if not distillation.get("share_student_resource_pool", False):
++        return "teacher_pool"
++
++    def require(condition, message):
++        if not condition:
++            raise ValueError(f"distillation.share_student_resource_pool: {message}")
++
++    require(config.trainer.nnodes == config.trainer.n_gpus_per_node == 1, "student must use one node and one GPU")
++    require(distillation.nnodes == distillation.n_gpus_per_node == 1, "teacher must use one node and one GPU")
++    student = config.actor_rollout_ref
++    require(student.hybrid_engine, "requires a hybrid student rollout")
++    require(student.actor.strategy in ("fsdp", "fsdp2"), "requires FSDP/FSDP2")
++    require(config.algorithm.adv_estimator == "grpo", "only critic-free GRPO is supported")
++    require(not student.actor.use_kl_loss and not config.algorithm.use_kl_in_reward, "reference policy is unsupported")
++    require(not config.reward.reward_model.enable, "reward model is unsupported")
++    require(
++        not config.reward.reward_model.get("enable_resource_pool", False), "separate reward GPU pool is unsupported"
++    )
++    teachers = distillation.teacher_models
++    require(len(teachers) == 1 and "teacher_model" in teachers, "requires the single teacher_model entry")
++    require(teachers.teacher_model.get("num_replicas", 0) in (0, 1), "requires one teacher replica")
++    require(
++        not teachers.teacher_model.inference.free_cache_engine,
++        "teacher free_cache_engine must be false (resident teacher)",
++    )
++    require(student.rollout.free_cache_engine, "student free_cache_engine must be true")
++    for name, inference in (("student", student.rollout), ("teacher", teachers.teacher_model.inference)):
++        require(inference.name == "vllm", f"{name} must use vLLM")
++        for field in (
++            "tensor_model_parallel_size",
++            "data_parallel_size",
++            "pipeline_model_parallel_size",
++            "expert_parallel_size",
++        ):
++            require(inference.get(field, 1) == 1, f"{name} {field} must be 1")
++        kwargs = inference.engine_kwargs.get("vllm", {})
++        # vLLM CLI serialization treats hyphens and underscores as aliases.
++        normalized_kwargs = {}
++        for key, value in kwargs.items():
++            canonical = key.replace("-", "_")
++            require(canonical not in normalized_kwargs, f"{name} duplicate engine_kwargs aliases for {canonical}")
++            normalized_kwargs[canonical] = value
++        # Do not let engine kwargs bypass the validated topology or lifecycle.
++        for field in (
++            "tensor_parallel_size",
++            "data_parallel_size",
++            "pipeline_parallel_size",
++            "enable_expert_parallel",
++            "enable_sleep_mode",
++            "enforce_eager",
++        ):
++            require(
++                field not in normalized_kwargs and f"no_{field}" not in normalized_kwargs,
++                f"{name} engine_kwargs cannot override {field}",
++            )
++        # Resident teachers must avoid vLLM's sleep-mode private memory pool:
++        # FP8 post-loading temporaries can remain reserved until loading ends.
++        expected_sleep_mode = name == "student"
++        require(
++            inference.get("enable_sleep_mode", True) == expected_sleep_mode,
++            f"{name} enable_sleep_mode must be {str(expected_sleep_mode).lower()}",
++        )
++        require(inference.enforce_eager, f"{name} enforce_eager must be true")
++        budget = normalized_kwargs.get("kv_cache_memory_bytes")
++        require(
++            isinstance(budget, int) and not isinstance(budget, bool) and budget > 0,
++            f"{name} requires a positive engine_kwargs.vllm.kv_cache_memory_bytes",
++        )
++    return "global_pool"

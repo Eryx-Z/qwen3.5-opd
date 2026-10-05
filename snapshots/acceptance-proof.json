@@ -1,0 +1,21 @@
+{
+  "metrics": {
+    "actor/loss": 1.7081298828125,
+    "actor/distillation/loss": 1.7081299424171448,
+    "actor/grad_norm": 831.6502685546875,
+    "actor/lr": 1e-06,
+    "training/global_step": 1.0
+  },
+  "optimizer_step_end": 1791214948.1778557,
+  "outcome": {
+    "reason": "child_exit",
+    "exit": 0,
+    "cleanup": {
+      "errors": [],
+      "ok": true,
+      "remaining": []
+    }
+  },
+  "min_available_gib": 27.64077377319336,
+  "lockfile_unchanged": true
+}

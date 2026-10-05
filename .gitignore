@@ -1,0 +1,11 @@
+.env
+.venv/
+models/
+data/
+logs/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.parquet
+__pycache__/

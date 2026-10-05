@@ -1,0 +1,161 @@
+{
+  "recorded_at_utc": "2026-10-05T16:06:40.543738+00:00",
+  "purpose": "Record the existing validated eryx OPD environment; not a model/data/env distribution or automatic installer.",
+  "host": {
+    "ssh_alias": "eryx",
+    "hostname": "eryx-spark",
+    "architecture": "aarch64",
+    "os": "Linux-7.0.0-1019-nvidia-aarch64-with-glibc2.39",
+    "gpu": "NVIDIA GB10",
+    "gpu_count": 1,
+    "compute_capability": "12.1",
+    "memory_kind": "CPU/GPU unified memory",
+    "driver": "580.173.02"
+  },
+  "runtime": {
+    "verl_dir": "/home/eryx/verl",
+    "venv": "/home/eryx/verl/.venv",
+    "python_executable": "/home/eryx/verl/.venv/bin/python",
+    "python_version": "3.12.3",
+    "pytorch_cuda": "13.0",
+    "uv": "uv 0.12.23 (aarch64-unknown-linux-gnu)",
+    "packages": {
+      "torch": "2.13.0+cu130",
+      "vllm": "0.29.0",
+      "verl": "0.10.0.dev0",
+      "transformers": "5.12.1",
+      "ray": "2.55.1",
+      "flash-attn": "2.8.3",
+      "tensordict": "0.10.0",
+      "torchdata": "0.11.0",
+      "accelerate": "1.14.0",
+      "datasets": "5.0.0",
+      "hydra-core": "1.3.3",
+      "omegaconf": "2.3.1"
+    }
+  },
+  "models": {
+    "teacher": {
+      "name": "Qwen3.5-35B-A3B-FP8",
+      "path": "/home/eryx/models/Qwen3.5-35B-A3B-FP8",
+      "model_type": "qwen3_5_moe",
+      "quant_method": "fp8",
+      "weight_shards": 14,
+      "weight_bytes": 37463724680,
+      "metadata_sha256": {
+        "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+        "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
+        "config.json": "236c373b0682a4f40c2fa49ef8e5f722a87a8dbfe265286b6d5260b23d7cb229",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "model.safetensors.index.json": "b009f7a49c442fce959a2ff6fee41c69248879b90d7ff5636ec6d2068ac4876d"
+      },
+      "all_weight_shards_hashed": false
+    },
+    "student": {
+      "name": "Qwen3.5-2B",
+      "path": "/home/eryx/models/Qwen3.5-2B",
+      "model_type": "qwen3_5",
+      "quant_method": null,
+      "weight_shards": 1,
+      "weight_bytes": 4548221488,
+      "metadata_sha256": {
+        "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "config.json": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "model.safetensors.index.json": "aca8afed9da75b0f050b408d270766fd77627f1af401e240f61c3b47d0db02f9"
+      },
+      "all_weight_shards_hashed": false
+    }
+  },
+  "verl_source": {
+    "repository": "https://github.com/verl-project/verl.git",
+    "base_commit": "8718ca30a3f002f93b7c4fd99b9b2506718681bc",
+    "working_tree_uncommitted": true,
+    "snapshot_patch": "snapshots/verl-working-tree.patch",
+    "changed_files_sha256": {
+      "examples/on_policy_distillation_trainer/README.single_gpu_smoke.md": "0c040315a78fed3629736a5def01d5ce4860a560998f718f5f1ddbc0fa11c59f",
+      "examples/on_policy_distillation_trainer/diagnostics/README.md": "4e991590bc67020f63cc1086b4354d2c294af37cbe22a086e3beaf2b04413b6b",
+      "examples/on_policy_distillation_trainer/diagnostics/guard.py": "b42398590fc5f4e6b0f1d40cc6a50ed76da38ab6cca469983dca16138038a68b",
+      "examples/on_policy_distillation_trainer/diagnostics/sitecustomize.py": "6ec1e08ae5d67d2ddc013169c8a23accc0d95838adcab1f43ae44b5c6b946996",
+      "examples/on_policy_distillation_trainer/run_qwen3_5_single_gpu_smoke.sh": "87d143496f1f23e748766c3521b1fdff8375f7cb738c567c13a84d100bb1133c",
+      "tests/single_controller/test_shared_teacher_pool_on_cpu.py": "899cceb4ea728ef6b5dbecf9cd5073dd1d84cdfa23d2200a27c1529fe230ef87",
+      "tests/trainer/test_opd_allocation_trace_on_cpu.py": "0b0f9df114fa44a362304705c21d4c571fe109872c9cc39443ed0e87a3e8733e",
+      "tests/trainer/test_opd_diagnostic_guard_on_cpu.py": "e9a4a688c11c2d8e80ecd3bd1c13709b3f34a6b4c560988b335c2024ac47fc9c",
+      "tests/trainer/test_resident_teacher_distillation_config_on_cpu.py": "4e4c08f4988cd9970b6cd93be78a5cc459809de5b59e5358b4c2282dba5f3eff",
+      "tests/trainer/test_shared_teacher_resource_pool_on_cpu.py": "1721b431d04377135138f28a92829162f3352ebf410a34a28c875bc3191d985b",
+      "tests/workers/rollout/test_vllm_resident_wake_up_on_cpu.py": "8f7ff83e628198dde28282d002941c451d16d0e7d7ae7ce39eba89999f117273",
+      "verl/experimental/teacher_loop/teacher_model.py": "36fb6a35f80a1cc5077925de57c60d2fac4fb182eb14d98c57aed4e0c201e4a1",
+      "verl/trainer/config/distillation/distillation.yaml": "d53024c24541d9576ac988a1cf0b4102a219e240125c547e041cbcd13f0614dd",
+      "verl/trainer/distillation/resource_pool.py": "8330e6c0f9f7fc1f5bd610027dadbc5fc58641933817cfa0e0e1c45a0c33bcd3",
+      "verl/trainer/main_ppo_v0.py": "16f2523741604dd8e03d3d51590a3587c8ad7caf02d024cc1720aeae18b8c156",
+      "verl/trainer/ppo/v1/trainer_base.py": "7964855533ae6e16e134911f4d1cfda2dece3fee5b13aa3e1145e178ec982693",
+      "verl/workers/config/distillation.py": "867aeba991ad0fe41d90f6278dbe5dbaeb91b7e089022ce6d80f424595b58013",
+      "verl/workers/rollout/vllm_rollout/vllm_async_server.py": "c3e846e83441790369b8fc53c69e4cb7fce324fdc8556e6e57aea91c82cbc471"
+    }
+  },
+  "validated_profile": {
+    "config_snapshot": "snapshots/validated-smoke-config.yaml",
+    "share_student_resource_pool": true,
+    "nodes": 1,
+    "physical_gpus": 1,
+    "teacher_sleep": false,
+    "teacher_free_cache": false,
+    "student_rollout_sleep": true,
+    "student_hf_attention": "sdpa",
+    "remove_padding": false,
+    "training_param_offload": false,
+    "training_optimizer_offload": false,
+    "training_model_dtype": "fp32",
+    "adamw_foreach": false,
+    "reward_workers": 1,
+    "teacher_kv_bytes": 536870912,
+    "student_kv_bytes": 268435456,
+    "batch": 2,
+    "prompt_max_tokens": 128,
+    "response_max_tokens": 16,
+    "training_steps": 1,
+    "algorithm": "grpo",
+    "distillation": "policy-gradient k1",
+    "eager_inference": true
+  },
+  "safety": {
+    "guard_script": "/home/eryx/verl/examples/on_policy_distillation_trainer/diagnostics/guard.py",
+    "min_memavailable_gib": 20,
+    "max_acpi_temperature_c": 75,
+    "timeout_seconds": 600,
+    "poll_seconds": 1,
+    "sensor_errors": "fail closed",
+    "ray_socket_path_limit_bytes": 107,
+    "limits_are_not_instantaneous_oom_guarantees": true
+  },
+  "validation": {
+    "artifact": "/home/eryx/opd-log5/acceptance-proof.json",
+    "metrics": {
+      "actor/loss": 1.7081298828125,
+      "actor/distillation/loss": 1.7081299424171448,
+      "actor/grad_norm": 831.6502685546875,
+      "actor/lr": 1e-06,
+      "training/global_step": 1.0
+    },
+    "data": "2 identical synthetic GSM8K-schema examples; question 1+1, answer 2; not the GSM8K dataset",
+    "regression_tests_passed": 144,
+    "min_memavailable_gib": 27.64077377319336,
+    "teacher_transient_reserved_gib": 83.322265625,
+    "max_swap_used_gib": 11.54848861694336,
+    "max_acpi_temperature_c": 56.1,
+    "long_run_stability_verified": false,
+    "training_quality_evaluated": false
+  },
+  "snapshots_sha256": {
+    "snapshots/acceptance-proof.json": "94711d313d9cf896e97b687debc498ce590bab01b3b04a813cd92af05e99faae",
+    "snapshots/installed-packages.txt": "aa90a26fb21270e839e39ddbd1e881fa2a406c68f97e19d2711581b6f500ff08",
+    "snapshots/uv.lock": "7f4be8c9a89a2ecc53d720583e376749aa618cba6a86faca66dcea6566ed94f7",
+    "snapshots/validated-smoke-config.yaml": "658311fd6307228648425894e48a059be07515d61b1ceb3e6799cc1decb56385",
+    "snapshots/verl-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "snapshots/verl-working-tree.patch": "4b75f8ab76993df147355136b69d61c827e8e39f872501a8c62cea3909c73ada"
+  }
+}

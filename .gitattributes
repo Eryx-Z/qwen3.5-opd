@@ -1,0 +1,2 @@
+# Preserve unified-diff context lines in the source snapshot.
+snapshots/*.patch -whitespace
