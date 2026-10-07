@@ -1,0 +1,45 @@
+{
+  "reference": "scripts/run_gsm8k_k1_300.sh -> run_gsm8k_k1_throughput100.sh -> run_gsm8k_k1_pilot.sh -> run_gsm8k_k1.sh; baselines/gsm8k_k1/resolved-pilot-config.yaml optimizer defaults",
+  "common_settings": {
+    "student": "/home/eryx/models/Qwen3.5-2B",
+    "teacher": "/home/eryx/models/Qwen3.5-35B-A3B-FP8",
+    "max_prompt_tokens": 512,
+    "max_new_tokens": 2048,
+    "batch_size": 32,
+    "micro_batch_size": 4,
+    "rollout_batch_size": 16,
+    "lr": 0.000001,
+    "weight_decay": 0.01,
+    "optimizer": "AdamW",
+    "betas": [0.9, 0.999],
+    "eps": 0.00000001,
+    "foreach": false,
+    "lr_scheduler": "constant",
+    "warmup": 0,
+    "grad_clip": 1.0,
+    "seed": 42,
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": "disabled: baseline vLLM -1 equals native Transformers 0",
+    "enable_thinking": false,
+    "steps": 300,
+    "save_every": 50,
+    "automatic_dev_test_eval": false
+  },
+  "necessary_cq_differences": [
+    "Full-vocabulary dynamic mixed KL and CQ segment selection, not sampled-k1 PPO surrogate.",
+    "Same native Student object generates, probes, scores and trains; no additional vLLM Student or CUDA Graph.",
+    "Explicit FP32 Student compute with TF32 disabled is the tested numerical option; baseline BF16 did not pass FD gates. Original Teacher remains FP8. This is NOT claimed as a precision-identical baseline comparison.",
+    "CQ-only probe4x4, chunk64, block16, keep ratio0.2 and unchanged FD rechecks.",
+    "Batch sampling provenance is batch seed plus row index; categorical rows are independently sampled, not labelled as individually seeded single-response replays."
+  ],
+  "bounded_acceptance_exceptions": {
+    "steps": 2,
+    "save_every": 1,
+    "reason": "Validate actual updates and checkpoint1 resume without automatically launching the baseline 300-step run. All common training sizes, response budget and optimizer settings remain baseline-aligned."
+  },
+  "status": "implementation and integration validation in progress; no accepted baseline-sized CQ update yet"
+}

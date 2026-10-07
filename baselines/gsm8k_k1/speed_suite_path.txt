@@ -1,0 +1,1 @@
+/home/eryx/qwen3.5-opd/runs/speed_20261006_072110

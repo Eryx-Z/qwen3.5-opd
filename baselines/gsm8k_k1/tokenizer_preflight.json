@@ -1,0 +1,19 @@
+{
+  "mapping_equal": true,
+  "special_tokens_equal": true,
+  "prompt_count": 44,
+  "max_prompt_tokens": 115,
+  "thinking": false,
+  "metadata_sha256": {
+    "/home/eryx/models/Qwen3.5-2B": {
+      "config.json": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4",
+      "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+      "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+    },
+    "/home/eryx/models/Qwen3.5-35B-A3B-FP8": {
+      "config.json": "236c373b0682a4f40c2fa49ef8e5f722a87a8dbfe265286b6d5260b23d7cb229",
+      "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+      "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+    }
+  }
+}

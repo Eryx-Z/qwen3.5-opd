@@ -1,0 +1,57 @@
+--- a/verl/trainer/distillation/resource_pool.py
++++ b/verl/trainer/distillation/resource_pool.py
+@@ -39,7 +39,16 @@
+         not teachers.teacher_model.inference.free_cache_engine,
+         "teacher free_cache_engine must be false (resident teacher)",
+     )
+-    require(student.rollout.free_cache_engine, "student free_cache_engine must be true")
++    # LoRA level-1 sleep copies the frozen base to CPU. On unified memory this
++    # need not release physical memory. Permit an explicitly resident adapter
++    # student, while retaining the original full-weight student restrictions.
++    model = student.get("model", {})
++    lora = model.get("lora", {})
++    adapter_student = (model.get("lora_rank", 0) > 0 or lora.get("rank", 0) > 0) and not lora.get("merge", False)
++    require(
++        student.rollout.free_cache_engine or adapter_student,
++        "student free_cache_engine must be true unless using an unmerged LoRA adapter",
++    )
+     for name, inference in (("student", student.rollout), ("teacher", teachers.teacher_model.inference)):
+         require(inference.name == "vllm", f"{name} must use vLLM")
+         for field in (
+@@ -71,7 +80,7 @@
+             )
+         # Resident teachers must avoid vLLM's sleep-mode private memory pool:
+         # FP8 post-loading temporaries can remain reserved until loading ends.
+-        expected_sleep_mode = name == "student"
++        expected_sleep_mode = name == "student" and student.rollout.free_cache_engine
+         require(
+             inference.get("enable_sleep_mode", True) == expected_sleep_mode,
+             f"{name} enable_sleep_mode must be {str(expected_sleep_mode).lower()}",
+--- a/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
++++ b/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
+@@ -53,6 +53,25 @@
+ 
+ def test_shared_pool_is_the_actual_student_pool():
+     assert teacher_resource_pool_id(config()) == "global_pool"
++
++
++@pytest.mark.parametrize("nested", [False, True])
++def test_resident_lora_student_is_supported_without_sleep_pool(nested):
++    cfg = config()
++    cfg.actor_rollout_ref.model = {"lora": {"rank": 8}} if nested else {"lora_rank": 8}
++    cfg.actor_rollout_ref.rollout.free_cache_engine = False
++    cfg.actor_rollout_ref.rollout.enable_sleep_mode = False
++    assert teacher_resource_pool_id(cfg) == "global_pool"
++
++
++@pytest.mark.parametrize("merge,sleep", [(True, False), (False, True)])
++def test_resident_lora_rejects_merge_or_sleep_pool(merge, sleep):
++    cfg = config()
++    cfg.actor_rollout_ref.model = {"lora_rank": 8, "lora": {"merge": merge}}
++    cfg.actor_rollout_ref.rollout.free_cache_engine = False
++    cfg.actor_rollout_ref.rollout.enable_sleep_mode = sleep
++    with pytest.raises(ValueError, match="share_student_resource_pool"):
++        teacher_resource_pool_id(cfg)
+ 
+ 
+ def test_default_does_not_validate_or_change_separate_pool():

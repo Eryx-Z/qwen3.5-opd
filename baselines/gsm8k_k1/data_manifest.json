@@ -1,0 +1,31 @@
+{
+  "dataset": "openai/gsm8k",
+  "config": "main",
+  "revision": "740312add88f781978c0658806c59bc2815b9866",
+  "seed": 42,
+  "files": {
+    "probe": {
+      "count": 500,
+      "sha256": "d779d921ff6fb85b5b86e4fb6318a6e441878e7d55a7bc00e4815ea83c2faadf"
+    },
+    "dev": {
+      "count": 973,
+      "sha256": "29bd2beab32258ac0099fbc8661c7ef8d302b7b59d1ef79e62dc44fee3a91c35"
+    },
+    "train": {
+      "count": 6000,
+      "sha256": "f44e327255d1df493b591f0e623300a94034543bf4edcb3ca8660a1b0b7e915f"
+    },
+    "test": {
+      "count": 1319,
+      "sha256": "6cfb84819a693d44a0780187ed6b4c5ec5f51b5ef923e772a018e20a91e906cd"
+    }
+  },
+  "source_sha256": {
+    "train.parquet": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "test.parquet": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59"
+  },
+  "removed_duplicates": [],
+  "prompt_suffix": "Solve the problem. Give the final numeric answer after ####.",
+  "test_usage": "reserved; never passed to smoke or periodic validation"
+}

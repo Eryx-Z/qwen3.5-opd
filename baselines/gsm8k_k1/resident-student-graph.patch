@@ -1,0 +1,114 @@
+--- a/verl/trainer/distillation/resource_pool.py
++++ b/verl/trainer/distillation/resource_pool.py
+@@ -49,6 +49,15 @@
+         student.rollout.free_cache_engine or adapter_student,
+         "student free_cache_engine must be true unless using an unmerged LoRA adapter",
+     )
++    # Experimental graphs are opt-in only for resident adapter students: neither
++    # graph memory nor adapter pointers are offloaded or replaced by sleep here.
++    allow_student_graph = distillation.get("allow_student_cuda_graph", False)
++    require(isinstance(allow_student_graph, bool), "allow_student_cuda_graph must be a boolean")
++    if allow_student_graph:
++        require(
++            adapter_student and not student.rollout.free_cache_engine,
++            "student CUDA Graph requires a resident unmerged LoRA adapter",
++        )
+     for name, inference in (("student", student.rollout), ("teacher", teachers.teacher_model.inference)):
+         require(inference.name == "vllm", f"{name} must use vLLM")
+         for field in (
+@@ -85,7 +94,10 @@
+             inference.get("enable_sleep_mode", True) == expected_sleep_mode,
+             f"{name} enable_sleep_mode must be {str(expected_sleep_mode).lower()}",
+         )
+-        require(inference.enforce_eager, f"{name} enforce_eager must be true")
++        require(
++            inference.enforce_eager or (name == "student" and allow_student_graph),
++            f"{name} enforce_eager must be true unless explicitly opting in a resident LoRA student",
++        )
+         budget = normalized_kwargs.get("kv_cache_memory_bytes")
+         require(
+             isinstance(budget, int) and not isinstance(budget, bool) and budget > 0,
+--- a/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
++++ b/tests/trainer/test_shared_teacher_resource_pool_on_cpu.py
+@@ -70,6 +70,45 @@
+     cfg.actor_rollout_ref.model = {"lora_rank": 8, "lora": {"merge": merge}}
+     cfg.actor_rollout_ref.rollout.free_cache_engine = False
+     cfg.actor_rollout_ref.rollout.enable_sleep_mode = sleep
++    with pytest.raises(ValueError, match="share_student_resource_pool"):
++        teacher_resource_pool_id(cfg)
++
++
++def graph_config():
++    cfg = config()
++    cfg.actor_rollout_ref.model = {"lora_rank": 8}
++    cfg.actor_rollout_ref.rollout.free_cache_engine = False
++    cfg.actor_rollout_ref.rollout.enable_sleep_mode = False
++    cfg.actor_rollout_ref.rollout.enforce_eager = False
++    cfg.distillation.allow_student_cuda_graph = True
++    return cfg
++
++
++def test_explicit_resident_lora_student_graph_opt_in():
++    assert teacher_resource_pool_id(graph_config()) == "global_pool"
++
++
++def test_student_graph_still_rejected_without_opt_in():
++    cfg = graph_config()
++    del cfg.distillation.allow_student_cuda_graph
++    with pytest.raises(ValueError, match="student enforce_eager must be true"):
++        teacher_resource_pool_id(cfg)
++
++
++@pytest.mark.parametrize("mutation", ["full_weight", "merge", "sleep", "teacher_graph", "string_flag"])
++def test_graph_opt_in_does_not_relax_other_lifecycle_constraints(mutation):
++    cfg = graph_config()
++    if mutation == "full_weight":
++        cfg.actor_rollout_ref.model.lora_rank = 0
++    elif mutation == "merge":
++        cfg.actor_rollout_ref.model.lora = {"merge": True}
++    elif mutation == "sleep":
++        cfg.actor_rollout_ref.rollout.free_cache_engine = True
++        cfg.actor_rollout_ref.rollout.enable_sleep_mode = True
++    elif mutation == "teacher_graph":
++        cfg.distillation.teacher_models.teacher_model.inference.enforce_eager = False
++    else:
++        cfg.distillation.allow_student_cuda_graph = "yes"
+     with pytest.raises(ValueError, match="share_student_resource_pool"):
+         teacher_resource_pool_id(cfg)
+ 
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -262,6 +262,9 @@
+     enabled: bool = False
+     # Experimental resident teacher sharing the single hybrid student's placement group.
+     share_student_resource_pool: bool = False
++    # Experimental, validated with the full student topology in resource_pool.py.
++    # Only resident, unmerged LoRA students may opt in; teachers remain eager.
++    allow_student_cuda_graph: bool = False
+     n_gpus_per_node: int = 0
+     nnodes: int = 0
+     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
+--- a/tests/trainer/test_resident_teacher_distillation_config_on_cpu.py
++++ b/tests/trainer/test_resident_teacher_distillation_config_on_cpu.py
+@@ -38,6 +38,21 @@
+     )
+ 
+ 
++def test_runtime_dataclass_accepts_explicit_graph_flag_and_defaults_off():
++    from omegaconf import OmegaConf
++    from verl.utils.config import omega_conf_to_dataclass
++
++    assert DistillationConfig().allow_student_cuda_graph is False
++    cfg = omega_conf_to_dataclass(
++        OmegaConf.create({
++            "_target_": "verl.workers.config.distillation.DistillationConfig",
++            "enabled": False,
++            "allow_student_cuda_graph": True,
++        }),
++    )
++    assert cfg.allow_student_cuda_graph is True
++
++
+ def test_runtime_config_accepts_resident_teacher_without_sleep_pool():
+     cfg = build_config(shared=True, sleep=False, free_cache=False)
+     inference = next(iter(cfg.teacher_models.values())).inference
